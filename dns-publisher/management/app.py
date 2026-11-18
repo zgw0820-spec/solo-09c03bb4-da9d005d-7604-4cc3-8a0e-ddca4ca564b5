@@ -9,20 +9,28 @@ Responsibilities
 * Report per-node served revision, online/offline state and catch-up status,
   and an aggregate conclusion that can *never* read "synced" while a node is
   offline or behind.
-* Verify the latest revision against the real UDP DNS answers of both nodes.
+* Verify the latest revision against the real DNS answers of both nodes.
+  Verification speaks UDP first and, when a node sets TC (the answer group
+  does not fit its UDP payload budget), retries over TCP so a truncated
+  response is never mistaken for a missing-address mismatch. All network I/O
+  happens outside SQLite write transactions, so verification cannot block a
+  concurrent publish; if a newer revision appears while verification is in
+  flight, the stale revision is explicitly reported as superseded rather
+  than "verified".
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import struct
 import time
 from contextlib import asynccontextmanager
 from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
-from dnslib import QTYPE, RCODE, DNSRecord
+from dnslib import EDNS0, QTYPE, RCODE, DNSRecord
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
@@ -189,29 +197,105 @@ async def reconciler_loop() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Real DNS answer verification
+# Real DNS answer verification (UDP with EDNS(0), TCP fallback on TC)
 # --------------------------------------------------------------------------- #
-def _dns_query(host: str, port: int, domain: str, timeout: float = 3.0) -> dict:
+# EDNS UDP payload size advertised by the verifier. Large answer groups still
+# do not fit and come back TC=1, which triggers the TCP retry below.
+VERIFY_EDNS_UDP_SIZE = int(os.environ.get("VERIFY_EDNS_UDP_SIZE", "4096"))
+DNS_TIMEOUT = float(os.environ.get("DNS_TIMEOUT", "3"))
+
+
+def _dns_query_tcp(host: str, port: int, packet: bytes, timeout: float) -> bytes:
+    import socket
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, int(port)))
+        sock.sendall(struct.pack("!H", len(packet)) + packet)
+        chunks = []
+        # First read must yield the 2-octet length prefix.
+        header = b""
+        while len(header) < 2:
+            part = sock.recv(2 - len(header))
+            if not part:
+                raise ConnectionError("TCP DNS connection closed before length prefix")
+            header += part
+        (msg_len,) = struct.unpack("!H", header)
+        received = 0
+        while received < msg_len:
+            part = sock.recv(min(65535, msg_len - received))
+            if not part:
+                raise ConnectionError("TCP DNS connection closed mid-message")
+            chunks.append(part)
+            received += len(part)
+        return b"".join(chunks)
+    finally:
+        sock.close()
+
+
+def _dns_query(host: str, port: int, domain: str,
+               timeout: float = DNS_TIMEOUT) -> dict:
+    """Query one node over UDP, retrying over TCP when the reply sets TC.
+
+    The UDP question carries an EDNS(0) OPT pseudo-record advertising
+    ``VERIFY_EDNS_UDP_SIZE``. A TC=1 reply contains no usable answers, so the
+    full answer group is always re-fetched over TCP instead of being treated
+    as a (partial) match. Returns the wire details of the answer actually
+    compared plus the transports used.
+    """
     import socket
 
     question = DNSRecord.question(domain, qtype="A")
+    question.add_ar(EDNS0(udp_len=VERIFY_EDNS_UDP_SIZE, version=0))
+    wire_question = question.pack()
+
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.settimeout(timeout)
     try:
-        sock.sendto(question.pack(), (host, int(port)))
-        data, _ = sock.recvfrom(65535)
+        sock.sendto(wire_question, (host, int(port)))
+        udp_data, _ = sock.recvfrom(65535)
     finally:
         sock.close()
-    reply = DNSRecord.parse(data)
-    answers = []
-    for rr in reply.rr:
-        if QTYPE[rr.rtype] == "A":
-            answers.append(str(rr.rdata))
+
+    udp_reply = DNSRecord.parse(udp_data)
+    used_tcp = False
+    if udp_reply.header.tc:
+        # Truncated: the node deliberately withheld the whole answer group.
+        # Fetch the complete group over TCP before comparing anything.
+        tcp_data = _dns_query_tcp(host, port, wire_question, timeout)
+        reply = DNSRecord.parse(tcp_data)
+        used_tcp = True
+    else:
+        reply = udp_reply
+
+    answers = [str(rr.rdata) for rr in reply.rr if QTYPE[rr.rtype] == "A"]
     return {
         "rcode": RCODE[reply.header.rcode],
         "aa": bool(reply.header.aa),
         "answers": sorted(answers),
+        "answer_count": len(answers),
+        "udp_truncated": bool(udp_reply.header.tc),
+        "tcp_fallback": used_tcp,
+        "transport": "tcp" if used_tcp else "udp",
     }
+
+
+def _verify_node(node: dict, rev: dict) -> dict:
+    """Verify one node and compare its real answers to one fixed revision."""
+    try:
+        answer = _dns_query(node["dns_host"], node["dns_port"], rev["domain"])
+        match = (
+            answer["answers"] == sorted(rev["addresses"])
+            and answer["aa"]
+            and answer["rcode"] == "NOERROR"
+        )
+    except Exception as exc:
+        answer = {"error": str(exc), "transport": None,
+                  "udp_truncated": False, "tcp_fallback": False}
+        match = False
+    return {"node_id": node["id"], **answer,
+            "matches_latest_revision": match}
 
 
 # --------------------------------------------------------------------------- #
@@ -318,35 +402,48 @@ async def revisions() -> list[dict]:
         return [db.row_to_revision_dict(r) for r in db.list_revisions(conn)]
 
 
-@app.get("/verify", summary="以两端实际 DNS 答复核对最新修订")
+@app.get("/verify", summary="以两端实际 DNS 答复核对最新修订（TC 自动走 TCP）")
 async def verify() -> dict:
+    # Snapshot the target revision first. This short read closes its
+    # connection immediately: no DB transaction (and therefore no publish
+    # write lock) is held while the network probes below run.
     with db.get_conn() as conn:
         latest = db.latest_revision(conn)
         if latest is None:
             raise HTTPException(409, "尚无修订，无法核对")
         rev = db.row_to_revision_dict(latest)
+    expected_revision = rev["revision"]
 
     loop = asyncio.get_running_loop()
     findings = []
     all_match = True
     for node in NODES:
-        try:
-            answer = await loop.run_in_executor(
-                None, _dns_query, node["dns_host"], node["dns_port"], rev["domain"]
-            )
-            match = answer["answers"] == sorted(rev["addresses"]) and answer["aa"]
-        except Exception as exc:
-            answer = {"error": str(exc)}
-            match = False
-        all_match &= match
-        findings.append({"node_id": node["id"], **answer,
-                         "matches_latest_revision": match})
+        finding = await loop.run_in_executor(None, _verify_node, node, rev)
+        all_match &= finding["matches_latest_revision"]
+        findings.append(finding)
+
+    # A publish may have landed while the probes were in flight. Re-read the
+    # newest revision (another lock-free short read) and refuse to certify
+    # the old one: verification can only ever confirm the revision that is
+    # still current when the answer comes back.
+    with db.get_conn() as conn:
+        current_row = db.latest_revision(conn)
+    current_revision = current_row["revision"] if current_row else 0
+    superseded = current_revision > expected_revision
+
     return {
         "domain": rev["domain"],
-        "expected_revision": rev["revision"],
+        "expected_revision": expected_revision,
+        "current_revision": current_revision,
         "expected_addresses": sorted(rev["addresses"]),
+        "superseded_during_verification": superseded,
+        "verified_revision_current": all_match and not superseded,
         "all_nodes_match": all_match,
         "nodes": findings,
+        "message": (
+            "核验期间出现更新修订，旧修订不得视为已核实，请对最新修订重新发起核验。"
+            if superseded else None
+        ),
     }
 
 

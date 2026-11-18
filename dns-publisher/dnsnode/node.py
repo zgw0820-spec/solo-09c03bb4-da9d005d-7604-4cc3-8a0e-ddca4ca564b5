@@ -1,10 +1,23 @@
-"""Persistent authoritative DNS node (UDP) with a push control API.
+"""Persistent authoritative DNS node (UDP + TCP) with a push control API.
 
 The node owns its own SQLite database (independent persistent volume in
 Compose). It answers A queries for exactly one managed domain and applies the
 full address list atomically. A publish carrying a revision that is not
 strictly newer than the one already served is rejected with HTTP 409, so a
 late retry can never roll a node back to an old revision.
+
+Truncation policy (the node never serves a *partial* address group)
+--------------------------------------------------------------------
+The same port serves UDP and TCP simultaneously.
+
+* UDP without EDNS: the payload limit is the classic 512 octets.
+* UDP with EDNS(0): the payload limit is the client-advertised UDP size
+  (values below 512 are treated as 512).
+* If the complete answer section does not fit, the reply carries TC=1 and
+  *no* answer RRs at all — a truncated packet is never a partial list that a
+  verifier could mistake for the full one.
+* TCP always returns the complete address group currently served by this
+  node, regardless of its wire size.
 """
 from __future__ import annotations
 
@@ -16,15 +29,21 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib import request as urlrequest
 
-from dnslib import A, QTYPE, RCODE, RR, DNSRecord
+from dnslib import A, EDNS0, QTYPE, RCODE, RR, DNSRecord
 
 NODE_ID = os.environ.get("NODE_ID", "dns-node")
 DB_PATH = os.environ.get("NODE_DB_PATH", "/data/node.db")
-UDP_HOST = os.environ.get("UDP_HOST", "0.0.0.0")
-UDP_PORT = int(os.environ.get("UDP_PORT", "5353"))
+DNS_HOST = os.environ.get("DNS_HOST", os.environ.get("UDP_HOST", "0.0.0.0"))
+DNS_PORT = int(os.environ.get("DNS_PORT", os.environ.get("UDP_PORT", "5353")))
 HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8053"))
 DNS_TTL = int(os.environ.get("DNS_TTL", "30"))
+# UDP payload size advertised in our own EDNS(0) OPT pseudo-record.
+SERVER_EDNS_UDP_SIZE = int(os.environ.get("SERVER_EDNS_UDP_SIZE", "4096"))
+# Classic DNS limit for non-EDNS UDP queries (RFC 1035 section 2.3.4).
+CLASSIC_UDP_LIMIT = 512
+# Absolute TCP message ceiling (2-octet length prefix).
+TCP_MESSAGE_LIMIT = 65535
 MGMT_BASE_URL = os.environ.get("MGMT_BASE_URL", "").rstrip("/")
 HEARTBEAT_INTERVAL = float(os.environ.get("HEARTBEAT_INTERVAL", "5"))
 
@@ -109,7 +128,7 @@ def apply_publish(revision: int, domain: str, addresses: list[str]) -> tuple[boo
         _current.update(
             revision=revision, domain=domain, addresses=list(addresses), applied_at=now
         )
-    print(f"[node {NODE_ID}] applied revision {revision}: {domain} -> {addresses}")
+    print(f"[node {NODE_ID}] applied revision {revision}: {domain} -> {len(addresses)} addrs")
     return True, "applied"
 
 
@@ -119,13 +138,39 @@ def snapshot() -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# UDP authoritative DNS server (dnslib)
+# UDP + TCP authoritative DNS server (dnslib)
 # --------------------------------------------------------------------------- #
+def _client_edns_udp_size(request: DNSRecord) -> int | None:
+    """Return the client-advertised EDNS UDP payload size, or None w/o EDNS.
+
+    Per RFC 6891 a sender MUST NOT advertise a value smaller than 512; such
+    values are tolerated by clamping up to 512.
+    """
+    for rr in request.ar:
+        if rr.rtype == QTYPE.OPT:
+            # In an OPT pseudo-record the CLASS field carries the UDP size.
+            return max(CLASSIC_UDP_LIMIT, int(rr.edns_len))
+    return None
+
+
+def _server_opt_record() -> EDNS0:
+    return EDNS0(udp_len=SERVER_EDNS_UDP_SIZE, version=0)
+
+
 class ManagedZoneResolver:
-    """Answers A queries for the managed domain only; authoritative AA=1."""
+    """Answers A queries for the managed domain only; authoritative AA=1.
+
+    A single resolver instance is shared by the UDP and TCP listener
+    threads; all state access goes through the locked ``snapshot``.
+    """
 
     def resolve(self, request: DNSRecord, handler) -> DNSRecord:
         reply = request.reply()
+        client_udp_size = _client_edns_udp_size(request)
+        # Echo OPT back to every EDNS client (RFC 6891), including errors.
+        if client_udp_size is not None:
+            reply.add_ar(_server_opt_record())
+
         qname = str(request.q.qname).rstrip(".")
         qtype = QTYPE[request.q.qtype]
         snap = snapshot()
@@ -143,16 +188,38 @@ class ManagedZoneResolver:
             reply.header.rcode = RCODE.SERVFAIL
             return reply
 
-        for addr in snap["addresses"]:  # the whole list takes effect together
+        # The whole list takes effect together: build the *complete* answer
+        # section first, then decide whether it fits the transport.
+        for addr in snap["addresses"]:
             reply.add_answer(
-                RR(
-                    request.q.qname,
-                    QTYPE.A,
-                    rdata=A(addr),
-                    ttl=DNS_TTL,
-                )
+                RR(request.q.qname, QTYPE.A, rdata=A(addr), ttl=DNS_TTL)
             )
-        return reply
+
+        protocol = getattr(handler, "protocol", "udp")
+        if protocol == "tcp":
+            # TCP always carries the full group; guard the 65535-octet
+            # wire ceiling instead of silently dropping records.
+            if len(reply.pack()) > TCP_MESSAGE_LIMIT:
+                overflow = request.reply()
+                overflow.header.rcode = RCODE.SERVFAIL
+                if client_udp_size is not None:
+                    overflow.add_ar(_server_opt_record())
+                return overflow
+            return reply
+
+        udp_limit = (
+            client_udp_size if client_udp_size is not None else CLASSIC_UDP_LIMIT
+        )
+        if len(reply.pack()) <= udp_limit:
+            return reply
+
+        # Does not fit: signal truncation with TC=1 and NO answer RRs.
+        # A partial answer must never be mistaken for the full group.
+        truncated = request.reply()
+        truncated.header.tc = 1
+        if client_udp_size is not None:
+            truncated.add_ar(_server_opt_record())
+        return truncated
 
 
 # --------------------------------------------------------------------------- #
@@ -259,9 +326,12 @@ def main() -> None:
     from dnslib.server import DNSServer
 
     resolver = ManagedZoneResolver()
-    dns_server = DNSServer(resolver, port=UDP_PORT, address=UDP_HOST, tcp=False)
-    dns_server.start_thread()
-    print(f"[node {NODE_ID}] UDP authoritative DNS on {UDP_HOST}:{UDP_PORT}")
+    # One resolver, two listeners sharing the same port: UDP and TCP.
+    udp_server = DNSServer(resolver, port=DNS_PORT, address=DNS_HOST, tcp=False)
+    tcp_server = DNSServer(resolver, port=DNS_PORT, address=DNS_HOST, tcp=True)
+    udp_server.start_thread()
+    tcp_server.start_thread()
+    print(f"[node {NODE_ID}] authoritative DNS on {DNS_HOST}:{DNS_PORT} (UDP + TCP)")
 
     http_server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), ControlHandler)
     print(f"[node {NODE_ID}] control API on {HTTP_HOST}:{HTTP_PORT}")
@@ -272,7 +342,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        dns_server.stop()
+        udp_server.stop()
+        tcp_server.stop()
         http_server.server_close()
 
 

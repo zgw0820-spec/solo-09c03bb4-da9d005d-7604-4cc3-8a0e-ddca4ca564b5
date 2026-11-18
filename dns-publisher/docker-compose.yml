@@ -36,13 +36,15 @@ services:
       NODE_ID: node-a
       NODE_DB_PATH: /data/node.db
       MGMT_BASE_URL: http://mgmt:8000
-      UDP_PORT: "5353"
+      DNS_PORT: "5353"
       HTTP_PORT: "8053"
       HEARTBEAT_INTERVAL: "5"
     volumes:
       - node-a-data:/data
     ports:
+      # Same port serves UDP and TCP inside the container; expose both.
       - "10053:5353/udp"
+      - "10053:5353/tcp"
     restart: unless-stopped
 
   node-b:
@@ -54,13 +56,14 @@ services:
       NODE_ID: node-b
       NODE_DB_PATH: /data/node.db
       MGMT_BASE_URL: http://mgmt:8000
-      UDP_PORT: "5353"
+      DNS_PORT: "5353"
       HTTP_PORT: "8053"
       HEARTBEAT_INTERVAL: "5"
     volumes:
       - node-b-data:/data
     ports:
       - "10054:5353/udp"
+      - "10054:5353/tcp"
     restart: unless-stopped
 
 volumes:

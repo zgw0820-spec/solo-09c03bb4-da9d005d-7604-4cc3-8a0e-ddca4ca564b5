@@ -2,13 +2,16 @@
 """端到端自测：在本机模拟 Compose 拓扑（管理服务 + 两个独立持久化节点）。
 
 覆盖:
-  1. 发布与双节点同步、整列表原子生效、实答一致
+  1. 发布与双节点同步、整列表原子生效、实答一致（小列表 UDP 不截断、TCP 同端口可查）
   2. 单节点失联：另一节点继续应答；状态显示待补，绝不误报 synced
   3. 节点恢复后自动补齐到最新修订
   4. 迟到的旧修订推送被节点拒绝(409)，节点/同步结论不回退
   5. 并发发布：修订严格递增、无重号
   6. 节点重启：独立 SQLite 持久化，服务版本不丢
   7. 非法输入校验
+  8. 大列表：无 EDNS 512 字节/EDNS 通告上限，超限 TC=1 且零部分答复；TCP 整组；
+     /verify 遇 TC 自动 TCP 核对
+  9. 核验与交错发布：旧修订不得误报已核实，核验不占用发布写锁
 
 用法: python scripts/selftest.py [python可执行路径]
 """
@@ -17,13 +20,17 @@ from __future__ import annotations
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+
+from dnslib import DNSRecord, EDNS0
 
 ROOT = Path(__file__).resolve().parent.parent
 PY = sys.argv[1] if len(sys.argv) > 1 else sys.executable
@@ -53,30 +60,74 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         print(f"  [FAIL] {name} {detail}")
 
 
-def http(method: str, path: str, body: dict | None = None, port: int = MGMT_PORT):
+def http(method: str, path: str, body: dict | None = None, port: int = MGMT_PORT,
+         timeout: float = 8.0):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}{path}", data=data,
         headers={"Content-Type": "application/json"}, method=method,
     )
     try:
-        with urllib.request.urlopen(req, timeout=8) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return r.status, json.loads(r.read() or b"{}")
     except urllib.error.HTTPError as e:
         return e.code, json.loads(e.read() or b"{}")
 
 
-def dns_answers(port: int, domain: str = DOMAIN, timeout: float = 3.0) -> set[str]:
-    from dnslib import DNSRecord
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    s.settimeout(timeout)
-    try:
-        s.sendto(DNSRecord.question(domain, qtype="A").pack(), ("127.0.0.1", port))
-        data, _ = s.recvfrom(65535)
-    finally:
-        s.close()
+def _question(domain: str, edns_size: int | None = None) -> bytes:
+    q = DNSRecord.question(domain, qtype="A")
+    if edns_size is not None:
+        q.add_ar(EDNS0(udp_len=edns_size, version=0))
+    return q.pack()
+
+
+def dns_query(port: int, domain: str = DOMAIN, timeout: float = 3.0,
+              edns_size: int | None = None, tcp: bool = False) -> dict:
+    """Return parsed reply details over UDP (optionally EDNS) or TCP."""
+    packet = _question(domain, edns_size)
+    if not tcp:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        try:
+            s.sendto(packet, ("127.0.0.1", port))
+            data, _ = s.recvfrom(65535)
+        finally:
+            s.close()
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(("127.0.0.1", port))
+            s.sendall(struct.pack("!H", len(packet)) + packet)
+            header = b""
+            while len(header) < 2:
+                part = s.recv(2 - len(header))
+                if not part:
+                    raise ConnectionError("TCP 连接提前关闭")
+                header += part
+            (msg_len,) = struct.unpack("!H", header)
+            chunks, got = [], 0
+            while got < msg_len:
+                part = s.recv(min(65535, msg_len - got))
+                if not part:
+                    raise ConnectionError("TCP 应答不完整")
+                chunks.append(part)
+                got += len(part)
+            data = b"".join(chunks)
+        finally:
+            s.close()
     reply = DNSRecord.parse(data)
-    return {str(rr.rdata) for rr in reply.rr}
+    return {
+        "tc": bool(reply.header.tc),
+        "aa": bool(reply.header.aa),
+        "answers": {str(rr.rdata) for rr in reply.rr},
+        "answer_count": len(reply.rr),
+        "raw_len": len(data),
+    }
+
+
+def dns_answers(port: int, domain: str = DOMAIN, timeout: float = 3.0) -> set[str]:
+    return dns_query(port, domain, timeout)["answers"]
 
 
 def wait_status(cond, timeout: float = 20.0, interval: float = 0.5):
@@ -99,13 +150,14 @@ def start_node(spec: dict) -> subprocess.Popen:
         "NODE_ID": spec["id"],
         "NODE_DB_PATH": str(data_dir / "node.db"),
         "MGMT_BASE_URL": f"http://127.0.0.1:{MGMT_PORT}",
-        "UDP_PORT": str(spec["udp"]),
+        "DNS_PORT": str(spec["udp"]),
         "HTTP_PORT": str(spec["http"]),
         "HEARTBEAT_INTERVAL": "2",
     })
+    log = open(tmpdir / f"{spec['id']}.log", "w")
     p = subprocess.Popen(
         [PY, "-m", "dnsnode.node"], cwd=ROOT, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=log, stderr=subprocess.STDOUT, text=True,
     )
     procs[spec["id"]] = p
     return p
@@ -127,11 +179,12 @@ def start_mgmt() -> subprocess.Popen:
         "RECONCILE_INTERVAL": "1",
         "NODES": nodes_json,
     })
+    log = open(tmpdir / "mgmt.log", "w")
     p = subprocess.Popen(
         [PY, "-m", "uvicorn", "management.app:app",
          "--host", "127.0.0.1", "--port", str(MGMT_PORT)],
         cwd=ROOT, env=env,
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        stdout=log, stderr=subprocess.STDOUT, text=True,
     )
     procs["mgmt"] = p
     return p
@@ -184,6 +237,14 @@ def scenario_basic() -> None:
     check("节点A 实答=整列表", a == {"10.0.0.1", "10.0.0.2"}, str(a))
     check("节点B 实答=整列表", b == {"10.0.0.1", "10.0.0.2"}, str(b))
     check("两端实际答复一致", a == b)
+    # 小列表在 512 字节内：UDP 不得置 TC，TCP 同端口同样可查且结果一致。
+    small = dns_query(NODE_SPECS[0]["udp"])
+    check("小列表 UDP 无截断(TC=0)且带完整答复",
+          not small["tc"] and small["answers"] == a and small["raw_len"] <= 512,
+          str(small))
+    small_tcp = dns_query(NODE_SPECS[0]["udp"], tcp=True)
+    check("同端口 TCP 查询返回整组小列表",
+          not small_tcp["tc"] and small_tcp["answers"] == a, str(small_tcp))
 
     code, ver = http("GET", "/verify")
     check("/verify 全部匹配最新修订", code == 200 and ver["all_nodes_match"], json.dumps(ver))
@@ -340,6 +401,201 @@ def scenario_interleave() -> None:
           == {"198.51.100.4"})
 
 
+def scenario_truncation() -> None:
+    print("\n=== 8. 大列表: UDP 512/EDNS 上限与 TC, TCP 整组, /verify 自动回退 ===")
+    # 40 个 A 记录在该域名下约 660 字节: 超过无 EDNS 的 512, 但 EDNS 4096 放得下。
+    medium = [f"10.20.{i // 256}.{i % 256}" for i in range(40)]
+    code, body = http("POST", "/publishes", {"addresses": medium})
+    check("发布 40 地址中等列表成功", code == 201, str(body))
+    wait_status(lambda s: s["overall_status"] == "synced", timeout=25)
+
+    for spec in NODE_SPECS:
+        port = spec["udp"]
+        no_edns = dns_query(port, edns_size=None)
+        check(f"{spec['id']} 无 EDNS: TC=1 且不返回部分地址(0 条答复)",
+              no_edns["tc"] and no_edns["answer_count"] == 0
+              and no_edns["raw_len"] <= 512, str(no_edns))
+        with_edns = dns_query(port, edns_size=4096)
+        check(f"{spec['id']} EDNS(4096): 不截断且返回整组 40 条",
+              not with_edns["tc"] and with_edns["answers"] == set(medium)
+              and with_edns["answer_count"] == 40, str(with_edns))
+        tight = dns_query(port, edns_size=512)
+        check(f"{spec['id']} EDNS(512) 同样放不下: TC=1、零答复",
+              tight["tc"] and tight["answer_count"] == 0, str(tight))
+        via_tcp = dns_query(port, tcp=True)
+        check(f"{spec['id']} TCP 查询返回当次服务的整组地址",
+              not via_tcp["tc"] and via_tcp["answers"] == set(medium)
+              and via_tcp["answer_count"] == 40, str(via_tcp))
+
+    code, ver = http("GET", "/verify")
+    check("中等列表 /verify 经 UDP(EDNS) 直接核对通过",
+          code == 200 and ver["all_nodes_match"]
+          and all(n["transport"] == "udp" and not n["tcp_fallback"]
+                  for n in ver["nodes"]), json.dumps(ver))
+
+    # 300 个 A 记录约 4.8KB : 超过 EDNS 4096 通告上限, UDP 必 TC, 核验须走 TCP。
+    large = [f"10.30.{i // 256}.{i % 256}" for i in range(300)]
+    code, body = http("POST", "/publishes", {"addresses": large})
+    check("发布 300 地址大列表成功", code == 201, str(body))
+    wait_status(lambda s: s["overall_status"] == "synced", timeout=30)
+
+    for spec in NODE_SPECS:
+        port = spec["udp"]
+        u = dns_query(port, edns_size=4096)
+        check(f"{spec['id']} 大列表 EDNS(4096) 仍超限: TC=1、零部分答复",
+              u["tc"] and u["answer_count"] == 0, str(u))
+        t = dns_query(port, tcp=True)
+        check(f"{spec['id']} 大列表 TCP 整组 300 条、AA=1",
+              not t["tc"] and t["aa"] and t["answers"] == set(large)
+              and t["answer_count"] == 300, str(t))
+
+    code, ver = http("GET", "/verify")
+    check("大列表 /verify 遇 TC 自动 TCP 核对且全部匹配",
+          code == 200 and ver["all_nodes_match"]
+          and all(n["udp_truncated"] and n["tcp_fallback"]
+                  and n["transport"] == "tcp"
+                  and n["answer_count"] == 300 for n in ver["nodes"]),
+          json.dumps(ver))
+    check("/verify 未把截断当成少地址",
+          all(not n["matches_latest_revision"] or n["answers"] == sorted(large)
+              for n in ver["nodes"]))
+
+    # 运维脚本同样应在 TC 后回退 TCP 并判定一致。
+    ops = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "verify_dns.py"), DOMAIN,
+         f"127.0.0.1:{NODE_SPECS[0]['udp']}",
+         f"127.0.0.1:{NODE_SPECS[1]['udp']}"],
+        cwd=ROOT, capture_output=True, text=True, timeout=30,
+    )
+    check("verify_dns.py 大列表 TC 后 TCP 核对退出码 0",
+          ops.returncode == 0, ops.stdout + ops.stderr)
+
+
+def scenario_verify_vs_publish() -> None:
+    print("\n=== 9. 核验与交错发布: 旧修订不得误报已核实, 不阻塞发布写锁 ===")
+    _, st0 = http("GET", "/status")
+    base = st0["latest_revision"]["revision"]
+
+    # 9a. 确定性竞态: 探针进程内打补丁撑开 /verify 探测窗口, 强制交错发布落入。
+    # 探针起独立端口的 uvicorn, 但复用同一管理库与 NODES 配置。
+    probe_env = dict(os.environ)
+    probe_env.update({
+        "RACE_MGMT_PORT": "18099",
+        "MANAGED_DOMAIN": DOMAIN,
+        "MGMT_DB_PATH": str(tmpdir / "management.db"),
+        "OFFLINE_AFTER_SECONDS": "5",
+        "RECONCILE_INTERVAL": "1",
+        "NODES": json.dumps([
+            {"id": s["id"],
+             "control_url": f"http://127.0.0.1:{s['http']}",
+             "dns_host": "127.0.0.1",
+             "dns_port": s["udp"]} for s in NODE_SPECS
+        ]),
+    })
+    probe = subprocess.run(
+        [PY, str(ROOT / "scripts" / "force_verify_race.py")],
+        cwd=ROOT, env=probe_env, capture_output=True, text=True, timeout=60,
+    )
+    forced_superseded = probe.returncode == 0
+    print(probe.stdout.strip())
+    if probe.stderr.strip():
+        print(probe.stderr.strip()[-1000:])
+    check("确定性探针: 核验窗口内发布后旧修订被标记 superseded、不报已核实",
+          forced_superseded, probe.stdout + probe.stderr)
+    _, _post = http("GET", "/status")
+    post_probe_rev = _post["latest_revision"]["revision"]
+
+    observed_superseded = threading.Event()
+    stop = threading.Event()
+    errors: list[str] = []
+
+    def verify_worker() -> None:
+        # 大列表让单次核验(含可能的 TCP 回退)耗时更长, 提高交错窗口。
+        while not stop.is_set():
+            try:
+                code, ver = http("GET", "/verify", timeout=15)
+                if code != 200:
+                    if len(errors) < 10:
+                        errors.append(f"verify http {code}: {ver}")
+                    time.sleep(0.1)
+                    continue
+                # 不变量 1: 一旦核验期间被新发布取代, 绝不能宣称旧修订已核实。
+                # all_nodes_match 只表示两端答复与"期望修订"一致(节点可能还
+                # 没切到新修订), 真正的核实结论是 verified_revision_current。
+                if ver["superseded_during_verification"]:
+                    observed_superseded.set()
+                    if ver["verified_revision_current"]:
+                        errors.append(
+                            f"被取代的旧修订 {ver['expected_revision']} 仍被报告核实"
+                        )
+                    if ver["current_revision"] <= ver["expected_revision"]:
+                        errors.append("superseded 标记与修订号矛盾")
+                else:
+                    # 未被取代时, 核实结论必须与逐节点匹配结果一致。
+                    if ver["verified_revision_current"] != ver["all_nodes_match"]:
+                        errors.append("未被取代但核实结论与节点匹配结果矛盾")
+                # 不变量 2: 只要结论是"已核实", 期望修订必须仍是当前修订。
+                if ver["verified_revision_current"] and (
+                    ver["current_revision"] != ver["expected_revision"]
+                    or ver["superseded_during_verification"]
+                ):
+                    errors.append("verified_revision_current 与取代状态矛盾")
+            except Exception as exc:  # 网络抖动可接受, 记录即可
+                if len(errors) < 10:
+                    errors.append(f"verify exc: {exc!r}")
+            time.sleep(0.1)  # 避免忙转打爆接口
+
+    worker = threading.Thread(target=verify_worker, daemon=True)
+    worker.start()
+
+    # 主线程持续发布(小列表, UDP 即可核对), 每次发布计时以暴露写锁被长占。
+    publish_latencies = []
+    made = 0
+    deadline = time.time() + 18
+    while time.time() < deadline:
+        t0 = time.time()
+        code, body = http("POST", "/publishes",
+                          {"addresses": [f"172.30.{made // 256}.{made % 256}"]})
+        publish_latencies.append(time.time() - t0)
+        if code != 201:
+            errors.append(f"publish failed {code}: {body}")
+            break
+        made += 1
+        time.sleep(0.35)
+    stop.set()
+    worker.join(timeout=5)
+
+    check("交错期间所有发布均 201, 修订无丢失",
+          made >= 5 and not any("publish failed" in e for e in errors),
+          f"made={made} errors={errors}")
+    _, st = http("GET", "/status")
+    # 以探针结束后的真实修订号为基线, 不假设探针是否成功提交了发布。
+    check("修订号恰好增加发布次数(写锁未被核验破坏)",
+          st["latest_revision"]["revision"] == post_probe_rev + made,
+          f"{st['latest_revision']['revision']} != {post_probe_rev + made}")
+    expected_rev = post_probe_rev + made
+    check("至少一次核验观察到修订被取代并正确标记",
+          observed_superseded.is_set() or forced_superseded,
+          str(errors))
+    check("无旧修订误报核实/状态矛盾", not errors, str(errors[:5]))
+    check("发布写锁未被核验长时间占用(单次发布 < 3s)",
+          max(publish_latencies, default=0) < 3.0,
+          f"max={max(publish_latencies, default=0):.2f}s")
+
+    st = wait_status(lambda s: s["overall_status"] == "synced", timeout=25)
+    check("交错发布后双节点重新收敛",
+          st["overall_status"] == "synced"
+          and all(n["served_revision"] == expected_rev for n in st["nodes"]),
+          json.dumps(st["nodes"]))
+    code, ver = http("GET", "/verify")
+    check("收敛后重新核验最新修订通过(小列表走 UDP)",
+          code == 200 and ver["all_nodes_match"]
+          and not ver["superseded_during_verification"]
+          and ver["verified_revision_current"]
+          and all(n["transport"] == "udp" for n in ver["nodes"]),
+          json.dumps(ver))
+
+
 def scenario_concurrent() -> None:
     print("\n=== 5. 并发发布: 修订严格递增无重号 ===")
     import concurrent.futures
@@ -404,8 +660,9 @@ def main() -> int:
         start_mgmt()
         if not wait_http(MGMT_PORT, "/status", timeout=20):
             print("管理服务启动失败")
-            if procs.get("mgmt"):
-                print(procs["mgmt"].stdout.read(4000))
+            log_path = tmpdir / "mgmt.log" if tmpdir else None
+            if log_path and log_path.exists():
+                print(log_path.read_text()[-4000:])
             return 2
         for spec in NODE_SPECS:
             start_node(spec)
@@ -419,6 +676,8 @@ def main() -> int:
         scenario_stale()
         scenario_interleave()
         scenario_concurrent()
+        scenario_truncation()
+        scenario_verify_vs_publish()
         scenario_persistence()
         scenario_validation()
     finally:
