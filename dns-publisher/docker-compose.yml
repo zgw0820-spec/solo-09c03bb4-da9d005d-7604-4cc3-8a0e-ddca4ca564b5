@@ -1,0 +1,69 @@
+name: dns-publisher
+
+services:
+  mgmt:
+    build:
+      context: .
+      dockerfile: management/Dockerfile
+    container_name: dns-mgmt
+    environment:
+      MANAGED_DOMAIN: device.example.internal
+      MGMT_DB_PATH: /data/management.db
+      OFFLINE_AFTER_SECONDS: "15"
+      RECONCILE_INTERVAL: "3"
+      NODES: >-
+        [
+          {"id":"node-a","control_url":"http://node-a:8053","dns_host":"node-a","dns_port":5353},
+          {"id":"node-b","control_url":"http://node-b:8053","dns_host":"node-b","dns_port":5353}
+        ]
+    volumes:
+      - mgmt-data:/data
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8000/status',timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  node-a:
+    build:
+      context: .
+      dockerfile: dnsnode/Dockerfile
+    container_name: dns-node-a
+    environment:
+      NODE_ID: node-a
+      NODE_DB_PATH: /data/node.db
+      MGMT_BASE_URL: http://mgmt:8000
+      UDP_PORT: "5353"
+      HTTP_PORT: "8053"
+      HEARTBEAT_INTERVAL: "5"
+    volumes:
+      - node-a-data:/data
+    ports:
+      - "10053:5353/udp"
+    restart: unless-stopped
+
+  node-b:
+    build:
+      context: .
+      dockerfile: dnsnode/Dockerfile
+    container_name: dns-node-b
+    environment:
+      NODE_ID: node-b
+      NODE_DB_PATH: /data/node.db
+      MGMT_BASE_URL: http://mgmt:8000
+      UDP_PORT: "5353"
+      HTTP_PORT: "8053"
+      HEARTBEAT_INTERVAL: "5"
+    volumes:
+      - node-b-data:/data
+    ports:
+      - "10054:5353/udp"
+    restart: unless-stopped
+
+volumes:
+  mgmt-data:
+  node-a-data:
+  node-b-data:
